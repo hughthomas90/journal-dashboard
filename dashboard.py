@@ -3,14 +3,12 @@ import pandas as pd
 import requests
 import datetime
 import time
-import math
 import plotly.express as px
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION
 # -----------------------------------------------------------------------------
 
-# Dictionary: Name -> List of ISSNs (Print and Electronic to ensure coverage)
 JOURNALS = {
     "The Lancet Gastroenterology & Hepatology": ["2468-1156"], 
     "Gastroenterology": ["0016-5085", "1528-0012"],
@@ -30,10 +28,11 @@ st.set_page_config(page_title="Live Impact Factor Dashboard", layout="wide", pag
 # API FUNCTIONS
 # -----------------------------------------------------------------------------
 
-def get_scopus_denominator_dois(issn_list, year_1, year_2, api_key, status_container=None):
+def get_scopus_documents(issn_list, year_1, year_2, api_key, only_citable=False, status_container=None):
     """
-    Fetches the list of DOIs for Articles and Reviews from Scopus.
-    Returns a DataFrame of the denominator items.
+    Fetches DOIs from Scopus.
+    if only_citable=True: Adds (DOCTYPE(ar) OR DOCTYPE(re)) -> For Denominator
+    if only_citable=False: Fetches EVERYTHING -> For Numerator Source
     """
     url = "https://api.elsevier.com/content/search/scopus"
     headers = {
@@ -41,23 +40,28 @@ def get_scopus_denominator_dois(issn_list, year_1, year_2, api_key, status_conta
         "Accept": "application/json"
     }
     
-    # Construct ISSN query: (ISSN(A) OR ISSN(B))
+    # Construct ISSN query
     issn_query = " OR ".join([f"ISSN({x})" for x in issn_list])
     
-    # Correct Year Logic: inclusive range
-    query = f"({issn_query}) AND PUBYEAR > {min(year_1, year_2) - 1} AND PUBYEAR < {max(year_1, year_2) + 1} AND (DOCTYPE(ar) OR DOCTYPE(re))"
+    # Base Query: Years + ISSN
+    # range is inclusive in our logic below, but Scopus integer logic needs explicit bounds
+    # e.g. for 2023-2024: PUBYEAR > 2022 AND PUBYEAR < 2025
+    query = f"({issn_query}) AND PUBYEAR > {min(year_1, year_2) - 1} AND PUBYEAR < {max(year_1, year_2) + 1}"
+    
+    if only_citable:
+        query += " AND (DOCTYPE(ar) OR DOCTYPE(re))"
     
     all_docs = []
     cursor = 0
-    batch_size = 25 # Scopus Search API default limit per page
+    batch_size = 25
     
-    # First call to get total count
     try:
+        # Initial call to get counts
         params = {
             "query": query,
             "count": batch_size,
             "start": cursor,
-            "field": "dc:identifier,dc:title,prism:doi,prism:coverDate,citedby-count"
+            "field": "dc:identifier,dc:title,prism:doi,prism:coverDate,prism:aggregationType,subtypeDescription" 
         }
         r = requests.get(url, headers=headers, params=params, timeout=15)
         r.raise_for_status()
@@ -72,11 +76,13 @@ def get_scopus_denominator_dois(issn_list, year_1, year_2, api_key, status_conta
         entries = search_results.get('entry', [])
         all_docs.extend(entries)
         
+        label = "Citable Items (Denom)" if only_citable else "All Content (Num Source)"
+        
         # Pagination
         while len(all_docs) < total_results:
             cursor += batch_size
             if status_container:
-                status_container.text(f"Fetching Scopus Denominator: {len(all_docs)} / {total_results} items...")
+                status_container.text(f"Fetching {label}: {len(all_docs)} / {total_results}...")
             
             params['start'] = cursor
             r = requests.get(url, headers=headers, params=params, timeout=15)
@@ -87,46 +93,44 @@ def get_scopus_denominator_dois(issn_list, year_1, year_2, api_key, status_conta
             if not new_entries:
                 break
             all_docs.extend(new_entries)
-            time.sleep(0.2) # Throttle slightly
+            time.sleep(0.1) # Mild throttle
             
     except Exception as e:
         st.error(f"Scopus API Error: {e}")
         return pd.DataFrame()
 
-    # Process into clean dataframe
     clean_data = []
     for doc in all_docs:
         clean_data.append({
             "doi": doc.get('prism:doi'),
             "title": doc.get('dc:title'),
             "date": doc.get('prism:coverDate'),
-            "scopus_id": doc.get('dc:identifier'),
-            "total_citations_lifetime": int(doc.get('citedby-count', 0)) # Lifetime, not year-specific
+            "type": doc.get('subtypeDescription'),
+            "scopus_id": doc.get('dc:identifier')
         })
     
     df = pd.DataFrame(clean_data)
-    # Remove entries without DOIs as they can't be linked
+    # We need DOIs to link to OpenAlex. 
+    # Items without DOIs (rare in Scopus for these journals) cannot be counted in numerator easily.
     df = df.dropna(subset=['doi'])
     return df
 
 def get_openalex_citations_batch(doi_list, target_year, status_container=None):
     """
-    Takes a list of DOIs, queries OpenAlex in batches, 
-    and returns a mapping {doi: citations_in_target_year}.
+    Queries OpenAlex for the citation count specifically in 'target_year'
+    for a list of DOIs.
     """
     base_url = "https://api.openalex.org/works"
     doi_citation_map = {doi: 0 for doi in doi_list}
     
-    # OpenAlex allows filtering by multiple DOIs (doi:A|doi:B). 
-    # Limit is roughly 50-100 DOIs per URL length.
+    # Chunking
     batch_size = 40
     chunks = [doi_list[i:i + batch_size] for i in range(0, len(doi_list), batch_size)]
-    
     total_chunks = len(chunks)
     
     for i, chunk in enumerate(chunks):
         if status_container:
-            status_container.text(f"Fetching OpenAlex Citations: Batch {i+1}/{total_chunks}...")
+            status_container.text(f"Counting Citations in {target_year}: Batch {i+1}/{total_chunks}...")
             
         doi_filter = "|".join([f"doi:{doi}" for doi in chunk])
         filter_param = f"doi:{doi_filter}"
@@ -147,8 +151,8 @@ def get_openalex_citations_batch(doi_list, target_year, status_container=None):
             results = data.get('results', [])
             
             for work in results:
-                # OpenAlex DOI format: https://doi.org/10.1016/...
-                # Scopus DOI format: 10.1016/...
+                # OpenAlex returns https://doi.org/10.1016/... 
+                # Scopus returns 10.1016/...
                 oa_doi = work.get('doi', '').replace("https://doi.org/", "")
                 
                 cby = work.get('counts_by_year', [])
@@ -162,206 +166,170 @@ def get_openalex_citations_batch(doi_list, target_year, status_container=None):
                     doi_citation_map[oa_doi] = count
                     
         except Exception:
-            pass # Skip failed batches to keep moving
-            
-        time.sleep(0.1)
+            pass 
+        time.sleep(0.05)
         
     return doi_citation_map
-
-def get_scopus_citations_heuristic(issn_list, journal_name, target_year, api_key):
-    """
-    Estimates 'Pure Scopus' citations using a Reference Search (REF).
-    Note: accurate searching for citations by year in Scopus requires 'Citation Overview' API (higher tier).
-    This uses the 'Search' API to find papers in target_year that mention the journal in references.
-    """
-    url = "https://api.elsevier.com/content/search/scopus"
-    headers = {"X-ELS-APIKey": api_key, "Accept": "application/json"}
-    
-    # We search for papers published in target_year that reference the journal title
-    # Removing 'The' can sometimes help REF matching in Scopus
-    search_title = journal_name.replace("The ", "").split(":")[0]
-    
-    # Query: REF(Journal Name) AND PUBYEAR = Target
-    query = f'REF("{search_title}") AND PUBYEAR = {target_year}'
-    
-    params = {"query": query, "count": 0}
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=10)
-        data = r.json()
-        return int(data.get('search-results', {}).get('opensearch:totalResults', 0))
-    except:
-        return 0
 
 # -----------------------------------------------------------------------------
 # UI & LOGIC
 # -----------------------------------------------------------------------------
 
 st.title("Live Impact Factor Dashboard 📊")
-st.markdown("Use the tabs below to switch between the Summary View and the Audit Data inspector.")
 
-# Session State for storing heavy data
-if 'journal_data' not in st.session_state:
-    st.session_state['journal_data'] = {}
+if 'audit_data' not in st.session_state:
+    st.session_state['audit_data'] = {}
 
 with st.sidebar:
-    st.header("Configuration")
+    st.header("Settings")
     scopus_key = st.text_input("Scopus API Key", type="password")
     
-    current_date = datetime.date.today()
-    target_year = st.number_input("Target Citation Year", value=current_date.year - 1)
+    # Date Logic
+    today = datetime.date.today()
+    default_target = today.year 
     
-    st.info(f"Numerator: Citations in **{target_year}**\nDenominator: Papers in **{target_year-1}** & **{target_year-2}**")
+    target_year = st.number_input("Impact Factor Year (Numerator)", value=default_target, 
+                                  help="The year in which citations are counted. e.g., For 2025 IF, select 2025.")
     
-    mode = st.radio("Analysis Mode", ["Hybrid (Scopus Docs + OpenAlex Cites)", "Pure Scopus (Heuristic)"])
+    # Denom years are always Target-1 and Target-2
+    y1 = target_year - 1
+    y2 = target_year - 2
     
-    run_btn = st.button("Run Analysis", type="primary")
+    st.markdown(f"""
+    **Formula Logic:**
+    * **Numerator:** Citations in `{target_year}` to *ALL* content published in `{y1}` & `{y2}`.
+    * **Denominator:** Count of *Articles* & *Reviews* published in `{y1}` & `{y2}`.
+    """)
+    
+    run_btn = st.button("Calculate", type="primary")
 
-tab1, tab2 = st.tabs(["🏆 Dashboard", "🔍 Data Inspector"])
+tab_dash, tab_audit = st.tabs(["Dashboard", "Data Inspector"])
 
 if run_btn and scopus_key:
-    # Clear previous results
-    st.session_state['journal_data'] = {}
+    # Reset
+    st.session_state['audit_data'] = {}
     
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    status = st.empty()
+    progress = st.progress(0)
+    summary_rows = []
     
-    results_summary = []
+    total_journals = len(JOURNALS)
     
-    for i, (j_name, j_issns) in enumerate(JOURNALS.items()):
-        status_text.markdown(f"**Processing:** {j_name}")
+    for idx, (name, issns) in enumerate(JOURNALS.items()):
+        status.markdown(f"**Processing:** {name}")
         
-        # 1. Fetch Denominator (List of actual papers)
-        denom_df = get_scopus_denominator_dois(j_issns, target_year-1, target_year-2, scopus_key, status_text)
-        
+        # 1. Denominator: Fetch Scopus Articles + Reviews (Strict)
+        denom_df = get_scopus_documents(issns, y1, y2, scopus_key, only_citable=True, status_container=status)
         denom_count = len(denom_df)
-        numerator_count = 0
         
-        if denom_count > 0:
-            # 2. Fetch Numerator based on Mode
-            if mode.startswith("Hybrid"):
-                # Pass the exact DOIs to OpenAlex
-                doi_list = denom_df['doi'].tolist()
-                citations_map = get_openalex_citations_batch(doi_list, target_year, status_text)
-                
-                # Map citations back to the dataframe for auditing
-                denom_df['citations_target_year'] = denom_df['doi'].map(citations_map).fillna(0)
-                numerator_count = denom_df['citations_target_year'].sum()
-                
-            else:
-                # Pure Scopus
-                # For audit, we can't easily map back to individual papers without CitOverview API
-                # So we use the heuristic total
-                numerator_count = get_scopus_citations_heuristic(j_issns, j_name, target_year, scopus_key)
-                denom_df['citations_target_year'] = "N/A (Aggregated)" 
+        # 2. Numerator Source: Fetch Scopus ALL Docs (Broad)
+        # We need this list to query OpenAlex for citations to "non-citable" items too (Editorials etc)
+        # If denom_count is 0, we skip, but actually we should check if there are non-citable items? 
+        # Usually if denom is 0, journal might be wrong. But let's try fetch.
+        all_docs_df = get_scopus_documents(issns, y1, y2, scopus_key, only_citable=False, status_container=status)
         
+        if not all_docs_df.empty:
+            # 3. Get Citations from OpenAlex for ALL docs
+            all_dois = all_docs_df['doi'].tolist()
+            cit_map = get_openalex_citations_batch(all_dois, target_year, status_container=status)
+            
+            # Map back
+            all_docs_df['citations_target'] = all_docs_df['doi'].map(cit_map).fillna(0)
+            numerator_count = all_docs_df['citations_target'].sum()
+        else:
+            numerator_count = 0
+            
         # Calculate IF
         if_val = numerator_count / denom_count if denom_count > 0 else 0
         
-        # Store detailed data for Audit Tab
-        st.session_state['journal_data'][j_name] = {
-            "df": denom_df,
-            "numerator": numerator_count,
-            "denominator": denom_count,
-            "if": if_val
-        }
-        
-        results_summary.append({
-            "Journal": j_name,
-            "IF": if_val,
-            "Citations": numerator_count,
-            "Articles/Reviews": denom_count
+        summary_rows.append({
+            "Journal": name,
+            "Live IF": if_val,
+            "Numerator (Citations)": numerator_count,
+            "Denominator (Articles/Reviews)": denom_count
         })
         
-        progress_bar.progress((i + 1) / len(JOURNALS))
+        # Store for Audit
+        st.session_state['audit_data'][name] = {
+            "denom_df": denom_df,
+            "all_docs_df": all_docs_df
+        }
         
-    status_text.success("Analysis Complete!")
+        progress.progress((idx + 1) / total_journals)
+
+    status.success("Done!")
     time.sleep(1)
-    status_text.empty()
-    progress_bar.empty()
+    status.empty()
+    progress.empty()
+    
+    # Store summary in session state for persistence
+    st.session_state['summary_df'] = pd.DataFrame(summary_rows).sort_values("Live IF", ascending=False)
+
 
 # -----------------------------------------------------------------------------
 # TAB 1: DASHBOARD
 # -----------------------------------------------------------------------------
-with tab1:
-    if st.session_state['journal_data']:
-        # Create Summary DF from session state
-        summary_data = []
-        for name, data in st.session_state['journal_data'].items():
-            summary_data.append({
-                "Journal": name,
-                "Live IF": data['if'],
-                "Numerator": data['numerator'],
-                "Denominator": data['denominator']
-            })
+with tab_dash:
+    if 'summary_df' in st.session_state:
+        df = st.session_state['summary_df']
         
-        df_sum = pd.DataFrame(summary_data).sort_values("Live IF", ascending=False)
+        c1, c2 = st.columns([3, 2])
         
-        col1, col2 = st.columns([3, 2])
-        
-        with col1:
-            st.subheader("Rankings")
-            fig = px.bar(df_sum, x="Live IF", y="Journal", orientation='h', text_auto='.3f',
-                         color="Live IF", title=f"projected Impact Factor ({target_year})")
+        with c1:
+            st.subheader(f"Projected Impact Factor ({target_year})")
+            fig = px.bar(df, x="Live IF", y="Journal", orientation='h', text_auto='.3f',
+                         color="Live IF", color_continuous_scale="Viridis")
             fig.update_layout(yaxis={'categoryorder':'total ascending'}, height=600)
             st.plotly_chart(fig, use_container_width=True)
             
-        with col2:
-            st.subheader("Summary Table")
-            st.dataframe(df_sum.style.format({"Live IF": "{:.3f}", "Numerator": "{:,.0f}", "Denominator": "{:,.0f}"}), use_container_width=True)
-            
-            st.caption(f"**Methodology:** {mode}")
-            if mode.startswith("Pure"):
-                st.warning("⚠️ Pure Scopus Mode uses a 'References Search' heuristic. It is less accurate than Hybrid mode without an advanced Scopus subscription.")
+        with c2:
+            st.subheader("Metrics")
+            st.dataframe(
+                df.style.format({
+                    "Live IF": "{:.3f}", 
+                    "Numerator (Citations)": "{:,.0f}", 
+                    "Denominator (Articles/Reviews)": "{:,.0f}"
+                }), 
+                use_container_width=True
+            )
     else:
-        st.info("Run the analysis to see results.")
+        st.info("Enter Scopus API Key and click Calculate.")
 
 # -----------------------------------------------------------------------------
-# TAB 2: AUDIT / DATA INSPECTOR
+# TAB 2: AUDIT
 # -----------------------------------------------------------------------------
-with tab2:
-    st.header("Data Inspector")
-    st.markdown("Select a journal to see exactly which papers are included in the denominator and how many citations they contributed.")
-    
-    if st.session_state['journal_data']:
-        selected_journal = st.selectbox("Select Journal", list(st.session_state['journal_data'].keys()))
+with tab_audit:
+    if 'audit_data' in st.session_state and st.session_state['audit_data']:
+        selected = st.selectbox("Select Journal", list(st.session_state['audit_data'].keys()))
+        data = st.session_state['audit_data'][selected]
         
-        j_data = st.session_state['journal_data'][selected_journal]
-        j_df = j_data['df']
+        st.write(f"### {selected}")
         
-        if j_df.empty:
-            st.warning("No documents found for this journal in Scopus.")
-        else:
-            col_metrics1, col_metrics2 = st.columns(2)
-            col_metrics1.metric("Total Denominator Items", j_data['denominator'])
-            col_metrics2.metric("Total Numerator Citations", f"{j_data['numerator']:,.0f}")
+        # Audit Numerator
+        st.markdown("#### Numerator Contributors (All Content)")
+        st.caption(f"Showing citations received in {target_year} to all documents published in {y1}-{y2}.")
+        
+        num_df = data['all_docs_df'].copy()
+        if 'citations_target' in num_df.columns:
+            num_df = num_df.sort_values("citations_target", ascending=False)
             
-            st.subheader("Denominator Documents (Scopus)")
-            
-            # Sort by highest contributors if Hybrid
-            if 'citations_target_year' in j_df.columns and not isinstance(j_df.iloc[0]['citations_target_year'], str):
-                j_df = j_df.sort_values("citations_target_year", ascending=False)
+            # Flag if it's in denominator
+            denom_dois = set(data['denom_df']['doi'].tolist())
+            num_df['is_citable'] = num_df['doi'].apply(lambda x: "✅ Yes" if x in denom_dois else "❌ No")
             
             st.dataframe(
-                j_df, 
+                num_df[['doi', 'citations_target', 'is_citable', 'type', 'title', 'date']],
                 column_config={
-                    "doi": "DOI",
-                    "title": "Article Title",
-                    "date": "Pub Date",
-                    "citations_target_year": st.column_config.NumberColumn(
-                        f"Citations in {target_year}",
-                        help=f"Citations received in {target_year} (Source: OpenAlex)"
-                    ),
-                    "total_citations_lifetime": "Total Lifetime Cites"
+                    "citations_target": st.column_config.NumberColumn(f"Citations ({target_year})", format="%d"),
+                    "is_citable": "In Denom?",
+                    "type": "Scopus Type"
                 },
-                use_container_width=True,
-                height=600
+                use_container_width=True
             )
             
-            st.download_button(
-                "Download Audit CSV",
-                j_df.to_csv(index=False).encode('utf-8'),
-                f"{selected_journal}_audit.csv",
-                "text/csv"
-            )
+            st.metric("Total Numerator Citations", f"{num_df['citations_target'].sum():,.0f}")
+        else:
+            st.warning("No data found.")
+            
     else:
-        st.info("Run the analysis first to inspect data.")
+        st.write("Run calculation to inspect data.")
