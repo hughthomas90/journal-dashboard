@@ -38,8 +38,13 @@ def get_scopus_denominator(issn, year_1, year_2, api_key, debug=False):
         "Accept": "application/json"
     }
     
+    # Calculate correct range. 
+    # If years are 2023 and 2024, we want > 2022 AND < 2025.
+    start_year = min(year_1, year_2)
+    end_year = max(year_1, year_2)
+    
     # Query: ISSN(...) AND PUBYEAR range AND (Article OR Review)
-    query = f"issn({issn}) AND PUBYEAR > {year_1 - 1} AND PUBYEAR < {year_2 + 1} AND (DOCTYPE(ar) OR DOCTYPE(re))"
+    query = f"issn({issn}) AND PUBYEAR > {start_year - 1} AND PUBYEAR < {end_year + 1} AND (DOCTYPE(ar) OR DOCTYPE(re))"
     
     params = {
         "query": query,
